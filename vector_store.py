@@ -1,6 +1,7 @@
 # vector_store.py
 
-import numpy as np
+import os
+import chromadb
 from openai import OpenAI
 from config import (
     PROVIDER,
@@ -11,32 +12,26 @@ from config import (
 from corpus import DOCUMENTS
 
 # ---------------------------------------------------------------------------
-# Provider setup
-# Ollama exposes an OpenAI-compatible API, so we use the same OpenAI client
-# for both — just swap the base_url and model name.
+# Provider setup — same pattern as before
 # ---------------------------------------------------------------------------
 if PROVIDER == "ollama":
-    client = OpenAI(base_url=OLLAMA_BASE_URL, api_key="ollama")
+    client      = OpenAI(base_url=OLLAMA_BASE_URL, api_key="ollama")
     EMBED_MODEL = OLLAMA_EMBED_MODEL
-elif PROVIDER == "openai":
-    client = OpenAI(api_key=OPENAI_API_KEY)
-    EMBED_MODEL = OPENAI_EMBED_MODEL
 else:
-    # Anthropic doesn't have an embedding model, so we fall back to OpenAI
-    # for embeddings even when using Claude for chat. This is a real pattern
-    # used in production.
-    client = OpenAI(api_key=OPENAI_API_KEY)
+    client      = OpenAI(api_key=OPENAI_API_KEY)
     EMBED_MODEL = OPENAI_EMBED_MODEL
 
-CHUNK_SIZE    = 400   # characters per chunk
-CHUNK_OVERLAP = 80    # overlap between adjacent chunks
+CHUNK_SIZE     = 400
+CHUNK_OVERLAP  = 80
+CHROMA_DB_PATH = os.path.join(os.path.dirname(__file__), "chroma_db")
+COLLECTION     = "rag_pipeline"
 
 
 # ---------------------------------------------------------------------------
-# Step 1: Chunking
+# Chunking — unchanged from Stage 2
 # ---------------------------------------------------------------------------
 def chunk_document(doc: dict) -> list[dict]:
-    text  = doc["content"]
+    text   = doc["content"]
     chunks = []
     start  = 0
 
@@ -55,32 +50,52 @@ def chunk_document(doc: dict) -> list[dict]:
         if end == len(text):
             break
 
-        start += CHUNK_SIZE - CHUNK_OVERLAP   # slide forward with overlap
+        start += CHUNK_SIZE - CHUNK_OVERLAP
 
     return chunks
 
 
 # ---------------------------------------------------------------------------
-# Step 2: Embedding
+# Embedding — unchanged from Stage 2
 # ---------------------------------------------------------------------------
-def embed_texts(texts: list[str]) -> np.ndarray:
+def embed_texts(texts: list[str]) -> list[list[float]]:
     response = client.embeddings.create(
         model=EMBED_MODEL,
         input=texts,
     )
-    vectors = [item.embedding for item in response.data]
-    return np.array(vectors, dtype=np.float32)
+    return [item.embedding for item in response.data]
 
 
 # ---------------------------------------------------------------------------
-# Step 3: Index + Retrieval
+# ChromaDB vector store
 # ---------------------------------------------------------------------------
+# Key difference from Stage 2:
+# ChromaDB persists to disk at CHROMA_DB_PATH. On first run it embeds
+# everything and saves. On every subsequent run it loads from disk instantly
+# — no embedding calls, no startup cost.
+
 class VectorStore:
     def __init__(self):
-        self.chunks: list[dict]       = []
-        self.matrix: np.ndarray | None = None
+        self.chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+        self.collection    = self.chroma_client.get_or_create_collection(
+            name=COLLECTION,
+            # Tell ChromaDB we're supplying our own embeddings.
+            # This keeps our provider abstraction intact — ChromaDB doesn't
+            # call any embedding model itself.
+            metadata={"hnsw:space": "cosine"},
+        )
 
     def build(self, documents: list[dict]) -> None:
+        """
+        Embed and index all documents — but only if the collection is empty.
+        This is the key production pattern: build once, reuse forever.
+        """
+        existing = self.collection.count()
+
+        if existing > 0:
+            print(f"Index already exists ({existing} chunks). Skipping build.")
+            return
+
         print(f"Building index from {len(documents)} documents...")
 
         all_chunks = []
@@ -89,40 +104,108 @@ class VectorStore:
 
         print(f"  {len(all_chunks)} chunks created")
 
-        texts        = [c["text"] for c in all_chunks]
-        vectors      = embed_texts(texts)
+        # Prepare parallel lists for ChromaDB
+        ids        = []
+        texts      = []
+        embeddings = []
+        metadatas  = []
 
-        self.chunks  = all_chunks
-        self.matrix  = vectors
+        # Embed in one batch
+        chunk_texts = [c["text"] for c in all_chunks]
+        vectors     = embed_texts(chunk_texts)
 
-        print(f"  Index built — matrix shape: {self.matrix.shape}")
+        for i, (chunk, vector) in enumerate(zip(all_chunks, vectors)):
+            ids.append(f"{chunk['doc_id']}_chunk_{chunk['chunk_index']}")
+            texts.append(chunk["text"])
+            embeddings.append(vector)
+            metadatas.append({
+                "doc_id":      chunk["doc_id"],
+                "doc_title":   chunk["doc_title"],
+                "chunk_index": chunk["chunk_index"],
+            })
+
+        # Upsert into ChromaDB
+        # Upsert = insert if new, update if exists. Safe to call multiple times.
+        self.collection.upsert(
+            ids=ids,
+            documents=texts,
+            embeddings=embeddings,
+            metadatas=metadatas,
+        )
+
+        print(f"  Index built and persisted to {CHROMA_DB_PATH}")
 
     def retrieve(self, query: str, top_k: int = TOP_K_CHUNKS) -> list[dict]:
-        if self.matrix is None:
-            raise RuntimeError("Call build() before retrieve()")
+        """Embed the query and find the most similar chunks."""
+        query_vector = embed_texts([query])[0]
 
-        query_vec = embed_texts([query])[0]
+        results = self.collection.query(
+            query_embeddings=[query_vector],
+            n_results=top_k,
+            include=["documents", "metadatas", "distances"],
+        )
 
-        # Cosine similarity via normalised dot product
-        doc_norms   = np.linalg.norm(self.matrix, axis=1, keepdims=True)
-        query_norm  = np.linalg.norm(query_vec)
-        norm_matrix = self.matrix / (doc_norms + 1e-10)
-        norm_query  = query_vec   / (query_norm + 1e-10)
-        scores      = norm_matrix @ norm_query          # shape (N,)
+        chunks = []
+        for text, metadata, distance in zip(
+            results["documents"][0],
+            results["metadatas"][0],
+            results["distances"][0],
+        ):
+            # ChromaDB returns cosine distance (0 = identical, 2 = opposite)
+            # Convert to similarity score (1 = identical, -1 = opposite)
+            score = 1 - distance
 
-        top_indices = np.argsort(scores)[::-1][:top_k]
+            chunks.append({
+                "doc_id":    metadata["doc_id"],
+                "doc_title": metadata["doc_title"],
+                "text":      text,
+                "score":     round(score, 3),
+            })
 
-        results = []
-        for idx in top_indices:
-            chunk          = dict(self.chunks[idx])
-            chunk["score"] = float(scores[idx])
-            results.append(chunk)
+        return chunks
 
-        return results
+    def list_documents(self) -> list[dict]:
+        """
+        Return one entry per unique source document.
+        Used by the list_documents tool so the agent can explore the corpus.
+        """
+        results = self.collection.get(include=["metadatas"])
+
+        seen  = {}
+        for metadata in results["metadatas"]:
+            doc_id = metadata["doc_id"]
+            if doc_id not in seen:
+                seen[doc_id] = metadata["doc_title"]
+
+        return [{"id": k, "title": v} for k, v in sorted(seen.items())]
+
+    def get_document(self, doc_id: str) -> dict | None:
+        """
+        Return all chunks for a specific document, reassembled into full text.
+        Used by the get_document tool so the agent can read a full document.
+        """
+        results = self.collection.get(
+            where={"doc_id": doc_id},
+            include=["documents", "metadatas"],
+        )
+
+        if not results["ids"]:
+            return None
+
+        # Sort chunks by index and join
+        chunks = sorted(
+            zip(results["metadatas"], results["documents"]),
+            key=lambda x: x[0]["chunk_index"],
+        )
+
+        full_text = "\n".join(text for _, text in chunks)
+        title     = chunks[0][0]["doc_title"]
+
+        return {"id": doc_id, "title": title, "content": full_text}
 
 
 # ---------------------------------------------------------------------------
-# Module-level singleton — build once at startup, reuse everywhere
+# Module-level singleton
 # ---------------------------------------------------------------------------
 _store = VectorStore()
 
@@ -131,3 +214,9 @@ def build_index() -> None:
 
 def retrieve(query: str, top_k: int = TOP_K_CHUNKS) -> list[dict]:
     return _store.retrieve(query, top_k)
+
+def list_documents() -> list[dict]:
+    return _store.list_documents()
+
+def get_document(doc_id: str) -> dict | None:
+    return _store.get_document(doc_id)

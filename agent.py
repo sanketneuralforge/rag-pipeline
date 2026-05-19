@@ -101,6 +101,16 @@ def run_agent(user_question: str) -> str:
         else:
             # No tool call — this is the final answer
             final_answer = response.content
+
+            # Guard against empty responses from smaller models like Mistral
+            # that sometimes skip tool calls and return nothing
+            if not final_answer or not final_answer.strip():
+                messages.append({
+                    "role":    "user",
+                    "content": "You returned an empty response. You MUST call retrieve_documents first, then answer based on what you find."
+                })
+                continue  # go back to the top of the loop
+
             print(f"\n[Final Answer]\n{final_answer}")
             return final_answer
 

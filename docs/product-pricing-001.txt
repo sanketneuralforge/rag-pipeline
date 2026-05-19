@@ -1,0 +1,7 @@
+We offer three plans: Free, Pro, and Enterprise. The Free plan costs $0/month
+and includes 1 user seat, 5GB storage, and basic API access. The Pro plan costs
+$49/month per seat and includes unlimited users, 100GB storage, priority support,
+and advanced API access. The Enterprise plan has custom pricing and includes
+SSO, audit logs, dedicated support, SLA guarantees, and custom integrations.
+Annual billing provides a 20% discount on Pro plans. All plans include a 14-day
+free trial. Downgrading from Pro to Free results in immediate loss of Pro features.

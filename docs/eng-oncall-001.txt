@@ -1,0 +1,8 @@
+The engineering on-call rotation runs weekly, Sunday to Sunday. The primary
+on-call engineer is expected to respond to PagerDuty alerts within 5 minutes
+during business hours (9am-6pm local time) and within 15 minutes outside
+business hours. A secondary on-call engineer serves as backup and must be
+reachable at all times. On-call compensation is $200 per week for primary and
+$100 per week for secondary. Engineers are not expected to carry an on-call
+shift more than once every 6 weeks. After any major incident, a blameless
+post-mortem must be filed within 48 hours.

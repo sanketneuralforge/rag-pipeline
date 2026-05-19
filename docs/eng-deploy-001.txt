@@ -1,0 +1,9 @@
+All production deployments require a ticket in Linear with the 'deploy' label.
+Deployments are permitted Monday through Thursday between 10am and 3pm EST only.
+No deployments on Fridays or the day before a company holiday. Every deployment
+must be reviewed and approved by at least one senior engineer who is not the
+author. After merging, the deploying engineer must monitor the Datadog dashboard
+for 30 minutes and confirm no error rate spike before closing the ticket.
+Rollback procedure: run 'make rollback ENV=prod' from the repo root. This
+reverts to the previous container image. Page the on-call engineer if rollback
+does not stabilize error rates within 10 minutes.

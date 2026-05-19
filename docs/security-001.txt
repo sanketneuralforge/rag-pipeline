@@ -1,0 +1,8 @@
+All employee laptops must have full-disk encryption enabled and be enrolled in
+our MDM solution (Jamf for Mac, Intune for Windows). Employees must use the
+company VPN when accessing internal resources from outside the office. Passwords
+must be at least 16 characters and stored in the company-approved password
+manager (1Password). Multi-factor authentication (MFA) is mandatory for all
+company accounts. Security incidents must be reported to security@company.com
+within 1 hour of discovery. The company undergoes annual SOC 2 Type II audits.
+Employee access is reviewed quarterly and revoked within 24 hours of offboarding.
