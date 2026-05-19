@@ -5,6 +5,162 @@ Each stage is a separate commit — read the history to watch the system evolve.
 
 ---
 
+## Stage 3 — Tools & Memory
+
+### What this stage builds
+Replaces the in-memory numpy vector store with ChromaDB for persistent storage.
+Adds a real file loader replacing the inline corpus. Extends the agent from 1
+tool to 3 tools, each with a distinct purpose.
+
+### What changed from Stage 2
+
+| | Stage 2 | Stage 3 |
+|--|---------|---------|
+| Vector store | numpy matrix in RAM | ChromaDB on disk |
+| Index lifetime | Rebuilt every startup | Built once, reused forever |
+| Corpus | Hardcoded inline strings | `.txt` files loaded from `docs/` |
+| Tools | `retrieve_documents` only | + `list_documents` + `get_document` |
+
+### Architecture
+
+```
+User question
+     │
+     ▼
+┌─────────────────────────────────────────┐
+│              ReAct Loop                 │
+│         (max 3 iterations)              │
+└─────────────────────────────────────────┘
+     │
+     ├──────────────────────────────────────┐
+     ▼                                      ▼
+retrieve_documents        list_documents / get_document
+  (search by query)         (explore corpus by ID)
+     │                                      │
+     └──────────────┬───────────────────────┘
+                    ▼
+          ┌──────────────────┐
+          │    ChromaDB      │
+          │  (persisted to   │
+          │   chroma_db/)    │
+          └──────────────────┘
+                    │
+                    ▼
+          Answer + source citations
+```
+
+### Files
+
+| File | Purpose |
+|------|---------|
+| `config.py` | Provider config — unchanged from Stage 2 |
+| `corpus.py` | File loader — reads `.txt` files from `docs/` |
+| `docs/` | Document corpus — one `.txt` file per document |
+| `vector_store.py` | ChromaDB index — build once, persist forever |
+| `tools.py` | 3 tool schemas + executor |
+| `agent.py` | ReAct loop — unchanged from Stage 2 |
+| `main.py` | Entry point with 8 test questions |
+| `chroma_db/` | Auto-generated — persisted vector index on disk |
+
+### The 3 tools
+
+**`retrieve_documents(query)`** — Semantic search. Embeds the query and returns
+the top 3 most similar chunks from the corpus. First tool the agent calls for
+any factual question.
+
+**`list_documents()`** — Corpus explorer. Returns all document IDs and titles.
+Agent calls this when the user asks what topics are covered, or when it needs
+to find a document ID before calling `get_document`.
+
+**`get_document(doc_id)`** — Full document reader. Returns the complete text of
+a specific document reassembled from its chunks. Agent calls this when chunk
+retrieval is insufficient and it needs to read the whole document.
+
+### Key design decisions
+
+**Build once, reuse forever** — `VectorStore.build()` checks if the collection
+already has documents before embedding. On first run it embeds and persists.
+Every subsequent run loads from disk instantly with zero API calls.
+
+**Upsert not insert** — ChromaDB's `upsert()` is safe to call multiple times.
+Insert would fail with duplicate ID errors if called twice. This matters in
+production where you can't guarantee the index is empty.
+
+**We supply our own embeddings** — ChromaDB is told `hnsw:space: cosine` but
+we pass pre-computed vectors. This keeps provider abstraction intact — ChromaDB
+never calls an embedding model itself.
+
+**Cosine distance → similarity score** — ChromaDB returns distance (0 = identical).
+We convert to similarity (1 = identical) with `score = 1 - distance` for
+consistency with Stage 2 output.
+
+### How to run
+
+**Prerequisites**
+
+- Python 3.12+
+- Ollama running locally with `mistral` and `nomic-embed-text` pulled
+
+```bash
+ollama pull mistral
+ollama pull nomic-embed-text
+```
+
+**Install dependencies**
+
+```bash
+pip install openai anthropic numpy chromadb python-dotenv
+```
+
+**Run**
+
+```bash
+python main.py
+```
+
+First run builds and persists the index. Every subsequent run skips the build:
+
+```
+Loaded 6 documents from .../docs
+Index already exists (12 chunks). Skipping build.
+```
+
+**Switch providers**
+
+Edit `config.py`:
+
+```python
+PROVIDER = "anthropic"  # or "openai" or "ollama"
+```
+
+**Reset the index**
+
+Delete the `chroma_db/` folder and rerun. The index will rebuild from scratch:
+
+```bash
+rm -rf chroma_db/
+python main.py
+```
+
+### Known limitations at this stage
+
+- Tool selection is unreliable on smaller models (Mistral sometimes calls
+  `retrieve_documents` when `get_document` is more appropriate)
+- No query rewriting before first retrieval — vocabulary mismatch causes
+  misses on the first attempt
+- Single agent handles all reasoning — no specialization
+- All three issues are addressed in Stage 4 with multi-agent orchestration
+
+### Concepts this stage teaches
+
+- Why in-memory vector stores break in production (cost, latency, scale)
+- ChromaDB persistent collections — build once, query forever
+- Upsert vs insert for idempotent index builds
+- Tool description quality directly affects which tool the agent calls
+- The difference between search (retrieve_documents) and read (get_document)
+
+---
+
 ## Stage 2 — Minimal Working Agent (MVP)
 
 ### What this stage builds
@@ -95,23 +251,6 @@ Edit `config.py`:
 PROVIDER = "anthropic"  # or "openai" or "ollama"
 ```
 
-### What the ReAct loop looks like at runtime
-
-```
-============================================================
-Question: What is the rollback procedure for a bad deployment?
-============================================================
-
-[Iteration 1]
-  Tool call: retrieve_documents({'query': 'rollback procedure deployment'})
-  Result preview: [1] Source: Production Deployment Runbook (relevance: 0.73)...
-
-[Final Answer]
-To rollback a deployment, run 'make rollback ENV=prod' from the repo root.
-Page the on-call engineer if error rates don't stabilize within 10 minutes.
-Source: Production Deployment Runbook
-```
-
 ### Known limitations at this stage
 
 - Index is rebuilt from scratch on every run (fixed in Stage 3 with ChromaDB)
@@ -135,8 +274,8 @@ Source: Production Deployment Runbook
 |-------|----------------|--------|
 | 1 | Problem framing + system design doc | ✅ Done |
 | 2 | MVP ReAct agent + in-memory RAG | ✅ Done |
-| 3 | ChromaDB + persistent index + 3 tools | 🔜 Next |
-| 4 | Multi-agent orchestration | ⬜ Planned |
+| 3 | ChromaDB + persistent index + 3 tools | ✅ Done |
+| 4 | Multi-agent orchestration | 🔜 Next |
 | 5 | Eval harness | ⬜ Planned |
 | 6 | Guardrails + HITL | ⬜ Planned |
 | 7 | Production redesign | ⬜ Planned |
