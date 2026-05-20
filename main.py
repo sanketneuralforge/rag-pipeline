@@ -1,6 +1,5 @@
 # main.py
-
-from agent import run_agent
+from agents.orchestrator import run
 
 def main():
     questions = [
@@ -22,7 +21,7 @@ def main():
     ]
 
     for question in questions:
-        answer = run_agent(question)
+        answer = run(question)
         print(f"\nAnswer: {answer}")
         print("-" * 60)
 

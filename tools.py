@@ -82,7 +82,11 @@ TOOLS = [
 # ---------------------------------------------------------------------------
 def execute_tool(tool_name: str, tool_args: dict) -> str:
     if tool_name == "retrieve_documents":
-        results = retrieve(tool_args["query"])
+        query = tool_args["query"]
+        # Guard: Mistral sometimes passes a list instead of a string
+        if isinstance(query, list):
+            query = " ".join(query)
+        results = retrieve(query)
         return _format_chunks(results)
 
     if tool_name == "list_documents":

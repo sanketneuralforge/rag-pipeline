@@ -5,21 +5,22 @@ Each stage is a separate commit — read the history to watch the system evolve.
 
 ---
 
-## Stage 3 — Tools & Memory
+## Stage 4 — Multi-Agent Orchestration
 
 ### What this stage builds
-Replaces the in-memory numpy vector store with ChromaDB for persistent storage.
-Adds a real file loader replacing the inline corpus. Extends the agent from 1
-tool to 3 tools, each with a distinct purpose.
+Breaks the single ReAct agent into three specialized sub-agents coordinated
+by an orchestrator. Each agent has exactly one job. The orchestrator manages
+shared state and sequential handoff between agents.
 
-### What changed from Stage 2
+### What changed from Stage 3
 
-| | Stage 2 | Stage 3 |
+| | Stage 3 | Stage 4 |
 |--|---------|---------|
-| Vector store | numpy matrix in RAM | ChromaDB on disk |
-| Index lifetime | Rebuilt every startup | Built once, reused forever |
-| Corpus | Hardcoded inline strings | `.txt` files loaded from `docs/` |
-| Tools | `retrieve_documents` only | + `list_documents` + `get_document` |
+| Architecture | Single ReAct agent | Orchestrator + 3 sub-agents |
+| Query strategy | One query per question | 2-3 rewritten queries per question |
+| Tool selection | Agent decides everything | Retriever agent decides retrieval only |
+| Answer writing | Same agent that retrieves | Dedicated Synthesizer agent |
+| Failure mode | One agent drops responsibilities | Each agent fails independently |
 
 ### Architecture
 
@@ -27,72 +28,108 @@ tool to 3 tools, each with a distinct purpose.
 User question
      │
      ▼
-┌─────────────────────────────────────────┐
-│              ReAct Loop                 │
-│         (max 3 iterations)              │
-└─────────────────────────────────────────┘
+┌─────────────────────────────────────────────┐
+│                 Orchestrator                │
+│   manages shared state, sequential handoff  │
+└─────────────────────────────────────────────┘
      │
-     ├──────────────────────────────────────┐
-     ▼                                      ▼
-retrieve_documents        list_documents / get_document
-  (search by query)         (explore corpus by ID)
-     │                                      │
-     └──────────────┬───────────────────────┘
-                    ▼
-          ┌──────────────────┐
-          │    ChromaDB      │
-          │  (persisted to   │
-          │   chroma_db/)    │
-          └──────────────────┘
-                    │
-                    ▼
-          Answer + source citations
+     ▼ step 1
+┌─────────────────────┐
+│    Query Rewriter   │  rewrites question into 2-3 optimized search queries
+└─────────────────────┘
+     │ rewritten queries
+     ▼ step 2
+┌─────────────────────┐
+│      Retriever      │  executes tool calls, decides retrieve vs get_document
+└─────────────────────┘
+     │         │
+     ▼         ▼
+ retrieve   get_document
+ _documents  (ChromaDB)
+     │         │
+     └────┬────┘
+          │ retrieved chunks
+          ▼ step 3
+┌─────────────────────┐
+│     Synthesizer     │  writes grounded answer with citations
+└─────────────────────┘
+     │
+     ▼
+Answer + source citations
 ```
 
 ### Files
 
 | File | Purpose |
 |------|---------|
-| `config.py` | Provider config — unchanged from Stage 2 |
-| `corpus.py` | File loader — reads `.txt` files from `docs/` |
-| `docs/` | Document corpus — one `.txt` file per document |
-| `vector_store.py` | ChromaDB index — build once, persist forever |
-| `tools.py` | 3 tool schemas + executor |
-| `agent.py` | ReAct loop — unchanged from Stage 2 |
-| `main.py` | Entry point with 8 test questions |
-| `chroma_db/` | Auto-generated — persisted vector index on disk |
+| `config.py` | Provider config — unchanged |
+| `corpus.py` | File loader — unchanged |
+| `docs/` | Document corpus — unchanged |
+| `vector_store.py` | ChromaDB index — unchanged |
+| `tools.py` | 3 tools + execute_tool with list/string query guard |
+| `agents/__init__.py` | Package marker |
+| `agents/query_rewriter.py` | Rewrites question into optimized search queries |
+| `agents/retriever.py` | Executes tool calls, returns retrieved chunks |
+| `agents/synthesizer.py` | Writes grounded answer with citations |
+| `agents/orchestrator.py` | Coordinates sub-agents, manages shared state |
+| `agent.py` | Stage 2/3 single agent — kept for comparison |
+| `main.py` | Entry point — now calls orchestrator |
 
-### The 3 tools
+### The 3 sub-agents
 
-**`retrieve_documents(query)`** — Semantic search. Embeds the query and returns
-the top 3 most similar chunks from the corpus. First tool the agent calls for
-any factual question.
+**Query Rewriter** — Takes the user's raw question and returns 2-3 short,
+focused search queries using different vocabulary. Fixes vocabulary mismatch
+between what users say and what documents contain. Returns JSON array of
+query strings.
 
-**`list_documents()`** — Corpus explorer. Returns all document IDs and titles.
-Agent calls this when the user asks what topics are covered, or when it needs
-to find a document ID before calling `get_document`.
+**Retriever** — Takes the rewritten queries and executes tool calls against
+ChromaDB. Decides whether to use `retrieve_documents` (semantic search) or
+`get_document` (full document read). Returns all retrieved chunks as a single
+formatted string.
 
-**`get_document(doc_id)`** — Full document reader. Returns the complete text of
-a specific document reassembled from its chunks. Agent calls this when chunk
-retrieval is insufficient and it needs to read the whole document.
+**Synthesizer** — Takes the original question and all retrieved chunks. Writes
+a concise, grounded answer with source citations. Returns "I could not find an
+answer in the available documents." when context is insufficient.
+
+### Shared state
+
+The orchestrator passes a state dict forward through each step:
+
+```python
+state = {
+    "question":          "How many PTO days do employees get?",
+    "rewritten_queries": ["PTO accrual days", "paid leave entitlement", ...],
+    "retrieved_chunks":  "[1] Source: PTO & Leave Policy ...",
+    "final_answer":      "Full-time employees accrue 15 days...",
+}
+```
+
+No message queues. No async. Plain sequential handoff — the simplest pattern
+that solves the problem.
 
 ### Key design decisions
 
-**Build once, reuse forever** — `VectorStore.build()` checks if the collection
-already has documents before embedding. On first run it embeds and persists.
-Every subsequent run loads from disk instantly with zero API calls.
+**Specialization over generalization** — A single agent juggling retrieval,
+query rewriting, and synthesis drops one of those responsibilities under
+load. Specialization makes each failure mode independent and debuggable.
 
-**Upsert not insert** — ChromaDB's `upsert()` is safe to call multiple times.
-Insert would fail with duplicate ID errors if called twice. This matters in
-production where you can't guarantee the index is empty.
+**Sequential handoff, not peer-to-peer** — Sub-agents don't talk to each
+other. They only talk to the orchestrator via return values. This keeps the
+flow linear and easy to trace.
 
-**We supply our own embeddings** — ChromaDB is told `hnsw:space: cosine` but
-we pass pre-computed vectors. This keeps provider abstraction intact — ChromaDB
-never calls an embedding model itself.
+**Query rewriting as a first-class step** — Putting query rewriting before
+retrieval eliminates the vocabulary mismatch problem that caused Stage 3
+to need multiple retrieval iterations. Better queries on the first attempt
+reduces LLM calls and latency.
 
-**Cosine distance → similarity score** — ChromaDB returns distance (0 = identical).
-We convert to similarity (1 = identical) with `score = 1 - distance` for
-consistency with Stage 2 output.
+**Defensive tool argument parsing** — Mistral occasionally passes a list
+instead of a string for the query argument. The execute_tool function now
+coerces lists to strings before calling the vector store.
+
+**When NOT to use multi-agent** — If your single agent is working reliably,
+don't split it. Multi-agent adds LLM calls (cost + latency), more failure
+points, and debugging complexity. We split here because we had a demonstrated
+retrieval quality problem that specialization genuinely solves.
 
 ### How to run
 
@@ -118,13 +155,6 @@ pip install openai anthropic numpy chromadb python-dotenv
 python main.py
 ```
 
-First run builds and persists the index. Every subsequent run skips the build:
-
-```
-Loaded 6 documents from .../docs
-Index already exists (12 chunks). Skipping build.
-```
-
 **Switch providers**
 
 Edit `config.py`:
@@ -133,23 +163,94 @@ Edit `config.py`:
 PROVIDER = "anthropic"  # or "openai" or "ollama"
 ```
 
-**Reset the index**
+### What the orchestrator looks like at runtime
 
-Delete the `chroma_db/` folder and rerun. The index will rebuild from scratch:
+```
+============================================================
+Question: What is the rollback procedure for a bad deployment?
+============================================================
 
-```bash
-rm -rf chroma_db/
-python main.py
+[Step 1: Query Rewriter]
+  [QueryRewriter] Rewriting: 'What is the rollback procedure for a bad deployment?'
+  [QueryRewriter] Generated queries: ['revert failed deployment', 'rollback bad release steps', 'undo production deployment']
+
+[Step 2: Retriever]
+  [Retriever] Executing 3 queries
+  [Retriever] retrieve_documents({'query': 'revert failed deployment'})
+  [Retriever] retrieve_documents({'query': 'rollback bad release steps'})
+  [Retriever] retrieve_documents({'query': 'undo production deployment'})
+  [Retriever] Retrieved 3 result(s)
+
+[Step 3: Synthesizer]
+  [Synthesizer] Writing answer from retrieved context
+  [Synthesizer] Done
+
+[Final Answer]
+Run 'make rollback ENV=prod' from the repo root. Page the on-call engineer
+if error rates don't stabilize within 10 minutes.
+(Source: Production Deployment Runbook)
 ```
 
 ### Known limitations at this stage
 
-- Tool selection is unreliable on smaller models (Mistral sometimes calls
-  `retrieve_documents` when `get_document` is more appropriate)
-- No query rewriting before first retrieval — vocabulary mismatch causes
-  misses on the first attempt
-- Single agent handles all reasoning — no specialization
-- All three issues are addressed in Stage 4 with multi-agent orchestration
+- Query rewriter occasionally returns malformed JSON (falls back to original question)
+- Retriever sub-agent rarely calls `get_document` — tool description needs tuning
+- No formal eval suite — correctness is verified manually by reading output
+- No guardrails against prompt injection or hallucination under pressure
+- Both addressed in Stage 5 (evals) and Stage 6 (guardrails)
+
+### Concepts this stage teaches
+
+- Orchestrator vs worker pattern — one coordinator, multiple specialists
+- Shared state as a plain dict — the simplest multi-agent communication primitive
+- Sequential handoff vs peer-to-peer agent communication
+- Why specialization makes failure modes independent and debuggable
+- When multi-agent is over-engineering vs genuinely necessary
+- Defensive parsing of LLM tool arguments
+
+---
+
+## Stage 3 — Tools & Memory
+
+### What this stage builds
+Replaces the in-memory numpy vector store with ChromaDB for persistent storage.
+Adds a real file loader replacing the inline corpus. Extends the agent from 1
+tool to 3 tools, each with a distinct purpose.
+
+### What changed from Stage 2
+
+| | Stage 2 | Stage 3 |
+|--|---------|---------|
+| Vector store | numpy matrix in RAM | ChromaDB on disk |
+| Index lifetime | Rebuilt every startup | Built once, reused forever |
+| Corpus | Hardcoded inline strings | `.txt` files loaded from `docs/` |
+| Tools | `retrieve_documents` only | + `list_documents` + `get_document` |
+
+### The 3 tools
+
+**`retrieve_documents(query)`** — Semantic search. Embeds the query and returns
+the top 3 most similar chunks from the corpus. First tool the agent calls for
+any factual question.
+
+**`list_documents()`** — Corpus explorer. Returns all document IDs and titles.
+Agent calls this when the user asks what topics are covered, or when it needs
+to find a document ID before calling `get_document`.
+
+**`get_document(doc_id)`** — Full document reader. Returns the complete text of
+a specific document reassembled from its chunks. Agent calls this when chunk
+retrieval is insufficient and it needs to read the whole document.
+
+### Key design decisions
+
+**Build once, reuse forever** — `VectorStore.build()` checks if the collection
+already has documents before embedding. On first run it embeds and persists.
+Every subsequent run loads from disk instantly with zero API calls.
+
+**Upsert not insert** — ChromaDB's `upsert()` is safe to call multiple times.
+Insert would fail with duplicate ID errors if called twice.
+
+**Cosine distance → similarity score** — ChromaDB returns distance (0 = identical).
+We convert to similarity (1 = identical) with `score = 1 - distance`.
 
 ### Concepts this stage teaches
 
@@ -175,7 +276,6 @@ User question
      ▼
 ┌─────────────────────────────────┐
 │           ReAct Loop            │
-│                                 │
 │  Think → Act → Observe → Think  │
 │       (max 3 iterations)        │
 └─────────────────────────────────┘
@@ -184,23 +284,11 @@ User question
   ┌──────────────┐  ┌─────────────────────┐
   │  LLM (chat)  │  │    Vector Store     │
   │    Mistral   │  │  numpy + cosine sim │
-  │   /Claude    │  └─────────────────────┘
-  └──────────────┘
+  └──────────────┘  └─────────────────────┘
           │
           ▼
   Answer + source citations
 ```
-
-### Files
-
-| File | Purpose |
-|------|---------|
-| `config.py` | Single-file provider config — swap Ollama / Anthropic / OpenAI here |
-| `corpus.py` | Inline document corpus (6 company documents) |
-| `vector_store.py` | Chunking, embedding, cosine similarity retrieval |
-| `tools.py` | Tool schema (JSON) + tool executor |
-| `agent.py` | ReAct loop + provider-abstracted LLM calls |
-| `main.py` | Entry point with 6 test questions |
 
 ### Key design decisions
 
@@ -211,57 +299,14 @@ Ollama (local), Anthropic, and OpenAI. Zero changes to agent logic required.
 while loop that appends to a messages list. This is exactly what every
 framework abstracts.
 
-**In-memory vector store** — Chunks are embedded at startup and stored as
-a numpy matrix. Cosine similarity is computed via normalised dot product.
-Replaced by ChromaDB in Stage 3.
-
 **Chunking with overlap** — Documents are split into 400-character chunks
 with 80-character overlap. Overlap prevents key facts from being cut at
 chunk boundaries.
 
-### How to run
-
-**Prerequisites**
-
-- Python 3.12+
-- Ollama running locally with `mistral` and `nomic-embed-text` pulled
-
-```bash
-ollama pull mistral
-ollama pull nomic-embed-text
-```
-
-**Install dependencies**
-
-```bash
-pip install openai anthropic numpy python-dotenv
-```
-
-**Run**
-
-```bash
-python main.py
-```
-
-**Switch providers**
-
-Edit `config.py`:
-
-```python
-PROVIDER = "anthropic"  # or "openai" or "ollama"
-```
-
-### Known limitations at this stage
-
-- Index is rebuilt from scratch on every run (fixed in Stage 3 with ChromaDB)
-- Corpus is hardcoded inline (fixed in Stage 3 with a file loader)
-- Single retrieval tool only (fixed in Stage 3 with `list_documents` + `get_document` tools)
-- Mistral sometimes skips tool calls on ambiguous questions (mitigated with explicit system prompt rules)
-
 ### Concepts this stage teaches
 
 - ReAct loop mechanics (Reason + Act)
-- Tool calling at the API level — how the LLM requests a tool vs how your code executes it
+- Tool calling at the API level
 - Chunking and why document size matters for retrieval precision
 - Cosine similarity vs euclidean distance for text search
 - Provider abstraction pattern
@@ -275,8 +320,8 @@ PROVIDER = "anthropic"  # or "openai" or "ollama"
 | 1 | Problem framing + system design doc | ✅ Done |
 | 2 | MVP ReAct agent + in-memory RAG | ✅ Done |
 | 3 | ChromaDB + persistent index + 3 tools | ✅ Done |
-| 4 | Multi-agent orchestration | 🔜 Next |
-| 5 | Eval harness | ⬜ Planned |
+| 4 | Multi-agent orchestration | ✅ Done |
+| 5 | Eval harness | 🔜 Next |
 | 6 | Guardrails + HITL | ⬜ Planned |
 | 7 | Production redesign | ⬜ Planned |
 | 8 | Observability + tracing | ⬜ Planned |
