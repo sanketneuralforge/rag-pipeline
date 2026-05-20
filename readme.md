@@ -5,6 +5,130 @@ Each stage is a separate commit — read the history to watch the system evolve.
 
 ---
 
+## Stage 5 — Reliability & Evals
+
+### What this stage builds
+An eval harness with 13 test cases, three levels of automated scoring, and
+LLM-as-judge for non-deterministic answer evaluation. Establishes a baseline
+before any production changes are made.
+
+### What changed from Stage 4
+
+| | Stage 4 | Stage 5 |
+|--|---------|---------|
+| Correctness verification | Read terminal output manually | Automated scoring across 13 test cases |
+| Answer quality | Subjective | LLM-as-judge with rubric |
+| Abstention | Checked by eye | Automated marker detection |
+| Regression detection | None | Run `--eval` flag after any change |
+
+### Eval levels
+
+**Level 2 — Answer eval** — LLM-as-judge scores the agent's answer against a
+reference answer. Handles non-deterministic outputs where exact string matching
+fails. A second LLM reads question + reference + agent answer and returns
+`{"score": 0|1, "reason": "..."}`.
+
+**Level 3 — Abstention eval** — Checks whether the agent correctly says
+"I don't know" on unanswerable questions. Scans for abstention markers in the
+answer text. This is the most important eval for production trust.
+
+**Citation eval** — Checks whether the agent cited the expected source document
+in its answer. Runs on all answerable questions.
+
+### Baseline results (Ollama + Mistral, local hardware)
+
+> Fill in your actual numbers after the full eval run completes.
+
+```
+======================================================
+EVAL RESULTS
+======================================================
+Overall:     __/13 passed  (__%)
+L2 Answer:   __/10 correct (__%)    target: ≥ 80%
+L3 Abstain:  __/3  correct (__%)    target: ≥ 90%
+Citation:    __/10 cited   (__%)    target: ≥ 95%
+Avg latency: __s                    target: < 4s
+======================================================
+```
+
+> Note: Latency on local Ollama + Mistral is 90-200s per question due to
+> three sequential LLM calls. This is a hardware constraint, not an
+> architecture flaw. Addressed in Stage 7 with parallel async execution
+> and cloud model routing.
+
+### Files
+
+| File | Purpose |
+|------|---------|
+| `evals/__init__.py` | Package marker |
+| `evals/dataset.py` | 13 test cases — 10 answerable, 3 unanswerable |
+| `evals/judge.py` | LLM-as-judge + abstention + citation scorers |
+| `evals/runner.py` | Runs all evals, prints per-case results and summary |
+| `main.py` | Updated — `--eval` flag triggers eval suite |
+
+### How to run evals
+
+```bash
+python main.py --eval
+```
+
+Output per case:
+```
+[1/13] pto-001: How many PTO days do full-time employees get per year?
+  Latency:   203s
+  Answer:    Full-time employees accrue 15 days of paid time off per calendar year...
+  L2 Answer: ✅ Answer contains correct key facts
+  Citation:  ✅ Cited 'PTO & Leave Policy'
+```
+
+### Key design decisions
+
+**LLM-as-judge over string matching** — Agent answers are non-deterministic.
+"Employees get 15 PTO days yearly" and "Full-time employees accrue 15 days of
+paid time off per calendar year" are the same answer. String matching fails
+both. LLM-as-judge understands semantic equivalence.
+
+**Tight scoring rubric** — The judge prompt defines exact criteria: score 1
+if key facts are present even if worded differently, score 0 if facts are
+missing, wrong, or hallucinated. Tight rubrics reduce judge bias.
+
+**Lowercase key normalization** — Mistral capitalizes JSON keys (`"Score"`
+instead of `"score"`). The parser normalizes all keys to lowercase before
+reading them. Always normalize LLM-generated structured output before parsing.
+
+**Fail closed on parse errors** — If the judge returns unparseable output,
+we score 0, never 1. Silently passing a bad answer is worse than a false
+failure.
+
+**Abstention markers over LLM judge** — Checking for abstention phrases
+("could not find", "cannot find", etc.) is faster, cheaper, and more
+reliable than asking an LLM to judge it. Use deterministic checks wherever
+possible, LLM judge only when semantics matter.
+
+**Success criteria set in Stage 1** — The eval targets (80% answer accuracy,
+90% abstention, 95% citation) were defined before we wrote a line of code.
+Evals verify we hit the targets we designed for, not targets we reverse-
+engineered from the results.
+
+### Interview angle
+
+This stage prepares you to answer:
+- "How do you evaluate a non-deterministic system?"
+- "What is LLM-as-judge and what are its failure modes?"
+- "How do you prevent regressions when you change a prompt?"
+- "What is the difference between unit evals, trajectory evals, and end-to-end evals?"
+
+### Known limitations at this stage
+
+- No trajectory evals — we score final answers but not whether the agent
+  took the right path (e.g. called the right tools in the right order)
+- Judge is the same model as the agent — ideally use a stronger model as
+  judge (GPT-4o or Claude) for more reliable scoring
+- 13 test cases is a minimum viable dataset — production systems need 100+
+- Latency is 90-200s on local Ollama — addressed in Stage 7
+
+---
+
 ## Stage 4 — Multi-Agent Orchestration
 
 ### What this stage builds
@@ -20,191 +144,37 @@ shared state and sequential handoff between agents.
 | Query strategy | One query per question | 2-3 rewritten queries per question |
 | Tool selection | Agent decides everything | Retriever agent decides retrieval only |
 | Answer writing | Same agent that retrieves | Dedicated Synthesizer agent |
-| Failure mode | One agent drops responsibilities | Each agent fails independently |
-
-### Architecture
-
-```
-User question
-     │
-     ▼
-┌─────────────────────────────────────────────┐
-│                 Orchestrator                │
-│   manages shared state, sequential handoff  │
-└─────────────────────────────────────────────┘
-     │
-     ▼ step 1
-┌─────────────────────┐
-│    Query Rewriter   │  rewrites question into 2-3 optimized search queries
-└─────────────────────┘
-     │ rewritten queries
-     ▼ step 2
-┌─────────────────────┐
-│      Retriever      │  executes tool calls, decides retrieve vs get_document
-└─────────────────────┘
-     │         │
-     ▼         ▼
- retrieve   get_document
- _documents  (ChromaDB)
-     │         │
-     └────┬────┘
-          │ retrieved chunks
-          ▼ step 3
-┌─────────────────────┐
-│     Synthesizer     │  writes grounded answer with citations
-└─────────────────────┘
-     │
-     ▼
-Answer + source citations
-```
-
-### Files
-
-| File | Purpose |
-|------|---------|
-| `config.py` | Provider config — unchanged |
-| `corpus.py` | File loader — unchanged |
-| `docs/` | Document corpus — unchanged |
-| `vector_store.py` | ChromaDB index — unchanged |
-| `tools.py` | 3 tools + execute_tool with list/string query guard |
-| `agents/__init__.py` | Package marker |
-| `agents/query_rewriter.py` | Rewrites question into optimized search queries |
-| `agents/retriever.py` | Executes tool calls, returns retrieved chunks |
-| `agents/synthesizer.py` | Writes grounded answer with citations |
-| `agents/orchestrator.py` | Coordinates sub-agents, manages shared state |
-| `agent.py` | Stage 2/3 single agent — kept for comparison |
-| `main.py` | Entry point — now calls orchestrator |
 
 ### The 3 sub-agents
 
-**Query Rewriter** — Takes the user's raw question and returns 2-3 short,
-focused search queries using different vocabulary. Fixes vocabulary mismatch
-between what users say and what documents contain. Returns JSON array of
-query strings.
+**Query Rewriter** — Rewrites question into 2-3 optimized search queries using
+different vocabulary. Fixes vocabulary mismatch between user language and
+document language.
 
-**Retriever** — Takes the rewritten queries and executes tool calls against
-ChromaDB. Decides whether to use `retrieve_documents` (semantic search) or
-`get_document` (full document read). Returns all retrieved chunks as a single
-formatted string.
+**Retriever** — Executes tool calls against ChromaDB. Decides whether to use
+`retrieve_documents` or `get_document`. Returns all retrieved chunks.
 
-**Synthesizer** — Takes the original question and all retrieved chunks. Writes
-a concise, grounded answer with source citations. Returns "I could not find an
-answer in the available documents." when context is insufficient.
-
-### Shared state
-
-The orchestrator passes a state dict forward through each step:
-
-```python
-state = {
-    "question":          "How many PTO days do employees get?",
-    "rewritten_queries": ["PTO accrual days", "paid leave entitlement", ...],
-    "retrieved_chunks":  "[1] Source: PTO & Leave Policy ...",
-    "final_answer":      "Full-time employees accrue 15 days...",
-}
-```
-
-No message queues. No async. Plain sequential handoff — the simplest pattern
-that solves the problem.
+**Synthesizer** — Writes grounded answer with citations. Abstains correctly
+when context is insufficient.
 
 ### Key design decisions
 
 **Specialization over generalization** — A single agent juggling retrieval,
-query rewriting, and synthesis drops one of those responsibilities under
-load. Specialization makes each failure mode independent and debuggable.
+query rewriting, and synthesis drops one responsibility under load.
+Specialization makes each failure mode independent and debuggable.
 
-**Sequential handoff, not peer-to-peer** — Sub-agents don't talk to each
-other. They only talk to the orchestrator via return values. This keeps the
-flow linear and easy to trace.
+**Sequential handoff, not peer-to-peer** — Sub-agents only talk to the
+orchestrator via return values. Flow is linear and easy to trace.
 
-**Query rewriting as a first-class step** — Putting query rewriting before
-retrieval eliminates the vocabulary mismatch problem that caused Stage 3
-to need multiple retrieval iterations. Better queries on the first attempt
-reduces LLM calls and latency.
-
-**Defensive tool argument parsing** — Mistral occasionally passes a list
-instead of a string for the query argument. The execute_tool function now
-coerces lists to strings before calling the vector store.
-
-**When NOT to use multi-agent** — If your single agent is working reliably,
-don't split it. Multi-agent adds LLM calls (cost + latency), more failure
-points, and debugging complexity. We split here because we had a demonstrated
-retrieval quality problem that specialization genuinely solves.
-
-### How to run
-
-**Prerequisites**
-
-- Python 3.12+
-- Ollama running locally with `mistral` and `nomic-embed-text` pulled
-
-```bash
-ollama pull mistral
-ollama pull nomic-embed-text
-```
-
-**Install dependencies**
-
-```bash
-pip install openai anthropic numpy chromadb python-dotenv
-```
-
-**Run**
-
-```bash
-python main.py
-```
-
-**Switch providers**
-
-Edit `config.py`:
-
-```python
-PROVIDER = "anthropic"  # or "openai" or "ollama"
-```
-
-### What the orchestrator looks like at runtime
-
-```
-============================================================
-Question: What is the rollback procedure for a bad deployment?
-============================================================
-
-[Step 1: Query Rewriter]
-  [QueryRewriter] Rewriting: 'What is the rollback procedure for a bad deployment?'
-  [QueryRewriter] Generated queries: ['revert failed deployment', 'rollback bad release steps', 'undo production deployment']
-
-[Step 2: Retriever]
-  [Retriever] Executing 3 queries
-  [Retriever] retrieve_documents({'query': 'revert failed deployment'})
-  [Retriever] retrieve_documents({'query': 'rollback bad release steps'})
-  [Retriever] retrieve_documents({'query': 'undo production deployment'})
-  [Retriever] Retrieved 3 result(s)
-
-[Step 3: Synthesizer]
-  [Synthesizer] Writing answer from retrieved context
-  [Synthesizer] Done
-
-[Final Answer]
-Run 'make rollback ENV=prod' from the repo root. Page the on-call engineer
-if error rates don't stabilize within 10 minutes.
-(Source: Production Deployment Runbook)
-```
-
-### Known limitations at this stage
-
-- Query rewriter occasionally returns malformed JSON (falls back to original question)
-- Retriever sub-agent rarely calls `get_document` — tool description needs tuning
-- No formal eval suite — correctness is verified manually by reading output
-- No guardrails against prompt injection or hallucination under pressure
-- Both addressed in Stage 5 (evals) and Stage 6 (guardrails)
+**When NOT to use multi-agent** — If your single agent works reliably, don't
+split it. Multi-agent adds LLM calls (cost + latency), more failure points,
+and debugging complexity.
 
 ### Concepts this stage teaches
 
-- Orchestrator vs worker pattern — one coordinator, multiple specialists
-- Shared state as a plain dict — the simplest multi-agent communication primitive
-- Sequential handoff vs peer-to-peer agent communication
-- Why specialization makes failure modes independent and debuggable
+- Orchestrator vs worker pattern
+- Shared state as a plain dict
+- Sequential handoff vs peer-to-peer communication
 - When multi-agent is over-engineering vs genuinely necessary
 - Defensive parsing of LLM tool arguments
 
@@ -214,8 +184,7 @@ if error rates don't stabilize within 10 minutes.
 
 ### What this stage builds
 Replaces the in-memory numpy vector store with ChromaDB for persistent storage.
-Adds a real file loader replacing the inline corpus. Extends the agent from 1
-tool to 3 tools, each with a distinct purpose.
+Adds a real file loader. Extends the agent from 1 tool to 3 tools.
 
 ### What changed from Stage 2
 
@@ -226,39 +195,23 @@ tool to 3 tools, each with a distinct purpose.
 | Corpus | Hardcoded inline strings | `.txt` files loaded from `docs/` |
 | Tools | `retrieve_documents` only | + `list_documents` + `get_document` |
 
-### The 3 tools
-
-**`retrieve_documents(query)`** — Semantic search. Embeds the query and returns
-the top 3 most similar chunks from the corpus. First tool the agent calls for
-any factual question.
-
-**`list_documents()`** — Corpus explorer. Returns all document IDs and titles.
-Agent calls this when the user asks what topics are covered, or when it needs
-to find a document ID before calling `get_document`.
-
-**`get_document(doc_id)`** — Full document reader. Returns the complete text of
-a specific document reassembled from its chunks. Agent calls this when chunk
-retrieval is insufficient and it needs to read the whole document.
-
 ### Key design decisions
 
-**Build once, reuse forever** — `VectorStore.build()` checks if the collection
-already has documents before embedding. On first run it embeds and persists.
-Every subsequent run loads from disk instantly with zero API calls.
+**Build once, reuse forever** — `VectorStore.build()` skips if collection
+already exists. Zero embedding API calls on subsequent startups.
 
-**Upsert not insert** — ChromaDB's `upsert()` is safe to call multiple times.
-Insert would fail with duplicate ID errors if called twice.
+**Upsert not insert** — Safe to call multiple times. Insert fails on
+duplicate IDs.
 
-**Cosine distance → similarity score** — ChromaDB returns distance (0 = identical).
-We convert to similarity (1 = identical) with `score = 1 - distance`.
+**Cosine distance → similarity** — ChromaDB returns distance (0 = identical).
+Converted to similarity with `score = 1 - distance`.
 
 ### Concepts this stage teaches
 
-- Why in-memory vector stores break in production (cost, latency, scale)
-- ChromaDB persistent collections — build once, query forever
+- Why in-memory vector stores break in production
+- ChromaDB persistent collections
 - Upsert vs insert for idempotent index builds
-- Tool description quality directly affects which tool the agent calls
-- The difference between search (retrieve_documents) and read (get_document)
+- Tool description quality affects tool selection
 
 ---
 
@@ -268,47 +221,40 @@ We convert to similarity (1 = identical) with `score = 1 - distance`.
 A fully working RAG agent from scratch using raw API calls and no frameworks.
 The core ReAct loop is implemented by hand so every abstraction is visible.
 
-### Architecture
-
-```
-User question
-     │
-     ▼
-┌─────────────────────────────────┐
-│           ReAct Loop            │
-│  Think → Act → Observe → Think  │
-│       (max 3 iterations)        │
-└─────────────────────────────────┘
-          │              │
-          ▼              ▼
-  ┌──────────────┐  ┌─────────────────────┐
-  │  LLM (chat)  │  │    Vector Store     │
-  │    Mistral   │  │  numpy + cosine sim │
-  └──────────────┘  └─────────────────────┘
-          │
-          ▼
-  Answer + source citations
-```
-
 ### Key design decisions
 
 **Provider abstraction** — One config value (`PROVIDER`) switches between
-Ollama (local), Anthropic, and OpenAI. Zero changes to agent logic required.
+Ollama, Anthropic, and OpenAI. Zero changes to agent logic.
 
-**Manual ReAct loop** — No LangGraph or LlamaIndex. The loop is a plain
-while loop that appends to a messages list. This is exactly what every
-framework abstracts.
+**Manual ReAct loop** — Plain while loop appending to a messages list.
+This is exactly what every framework abstracts.
 
-**Chunking with overlap** — Documents are split into 400-character chunks
-with 80-character overlap. Overlap prevents key facts from being cut at
-chunk boundaries.
+**Chunking with overlap** — 400-character chunks with 80-character overlap.
+Prevents key facts from being cut at chunk boundaries.
+
+### How to run
+
+```bash
+# Install dependencies
+pip install openai anthropic numpy chromadb python-dotenv
+
+# Pull Ollama models
+ollama pull mistral
+ollama pull nomic-embed-text
+
+# Run agent
+python main.py
+
+# Run eval suite
+python main.py --eval
+```
 
 ### Concepts this stage teaches
 
-- ReAct loop mechanics (Reason + Act)
+- ReAct loop mechanics
 - Tool calling at the API level
-- Chunking and why document size matters for retrieval precision
-- Cosine similarity vs euclidean distance for text search
+- Chunking and retrieval precision
+- Cosine similarity vs euclidean distance
 - Provider abstraction pattern
 
 ---
@@ -321,8 +267,8 @@ chunk boundaries.
 | 2 | MVP ReAct agent + in-memory RAG | ✅ Done |
 | 3 | ChromaDB + persistent index + 3 tools | ✅ Done |
 | 4 | Multi-agent orchestration | ✅ Done |
-| 5 | Eval harness | 🔜 Next |
-| 6 | Guardrails + HITL | ⬜ Planned |
+| 5 | Eval harness | ✅ Done |
+| 6 | Guardrails + HITL | 🔜 Next |
 | 7 | Production redesign | ⬜ Planned |
 | 8 | Observability + tracing | ⬜ Planned |
 | 9 | Deployment | ⬜ Planned |
