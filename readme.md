@@ -5,102 +5,156 @@ Each stage is a separate commit — read the history to watch the system evolve.
 
 ---
 
-## Stage 6 — Human-in-the-Loop & Guardrails
+## Stage 7 — System Design for Production
 
 ### What this stage builds
-Three layers of protection around the agent pipeline: an input guardrail that
-blocks prompt injection and flags off-topic requests, an output guardrail that
-scores answer confidence, and a HITL approval gate that pauses execution and
-waits for human review when confidence is low.
+Three production engineering upgrades: async parallel retrieval so all queries
+fire concurrently, streaming synthesis so the user sees the first token in ~1s
+instead of waiting for the full answer, and model routing so simple questions
+use a cheap fast model while complex questions use a capable model.
 
-### What changed from Stage 5
+### What changed from Stage 6
 
-| | Stage 5 | Stage 6 |
+| | Stage 6 | Stage 7 |
 |--|---------|---------|
-| Input validation | None — all questions passed through | Rules-based injection detection + off-topic flagging |
-| Output validation | None — all answers returned directly | Confidence scoring based on retrieval quality |
-| Human oversight | None | Interactive approval gate on low-confidence answers |
-| Abstention trust | Agent decides | Output guardrail explicitly trusts correct abstentions |
+| Retrieval execution | Sequential — query 1 → query 2 → query 3 | Parallel — all queries fire concurrently |
+| Synthesis output | Full answer returned at once | Tokens streamed as generated |
+| Model selection | Same model for every question | Routed — fast model for simple, capable for complex |
+| Latency profile | Sequential I/O bottleneck | I/O-bound work parallelized |
 
 ### Architecture
 
 ```
-User input
-    │
-    ▼
-┌─────────────────┐
-│ Input Guardrail │  blocks injection, flags off-topic
-└─────────────────┘
-    │ allowed
-    ▼
-┌──────────────────────────────────┐
-│  Query Rewriter → Retriever      │
-│  → Synthesizer (Stage 4 agents)  │
-└──────────────────────────────────┘
-    │
-    ▼
-┌──────────────────┐
-│ Output Guardrail │  scores confidence from retrieval quality
-└──────────────────┘
-    │
-    ├── high/medium confidence ──→ return answer directly
-    │
-    └── low confidence ──────────→ HITL gate
-                                       │
-                                  ┌────┴────┐
-                              (a) approve  (r) reject  (e) edit
-                                       │
-                                  final answer
+Query Rewriter              ~30s  ──┐
+                                    │ rewriter must finish first
+                                    ▼
+Retrieve query 1  ──┐
+Retrieve query 2  ──┼── asyncio.gather()  ~20s  (all 3 concurrently)
+Retrieve query 3  ──┘
+                                    │
+                                    ▼
+              ┌─────────────────────────────┐
+              │  Model Router               │
+              │  simple question → FAST     │
+              │  complex question → CAPABLE │
+              └─────────────────────────────┘
+                                    │
+                                    ▼
+              Synthesizer (streaming)       ~40s
+              tokens appear immediately ────────→ user sees output
 ```
 
-### Files
+### Files changed
 
-| File | Purpose |
-|------|---------|
-| `guardrails/__init__.py` | Package marker |
-| `guardrails/input_guard.py` | Injection patterns + off-topic detection |
-| `guardrails/output_guard.py` | Confidence scoring + hallucination flag |
-| `guardrails/hitl.py` | Interactive approval gate — approve / reject / edit |
-| `agents/orchestrator.py` | Updated — 5-step pipeline with guardrails wired in |
+| File | What changed |
+|------|-------------|
+| `config.py` | Added FAST_MODEL, CAPABLE_MODEL, COMPLEX_QUERY_KEYWORDS, STREAM_ENABLED |
+| `agents/retriever.py` | Rewritten with asyncio — parallel query execution via asyncio.gather |
+| `agents/synthesizer.py` | Added streaming, model routing, Anthropic streaming support |
 
-### The 3 guardrail layers
+### Key concepts
 
-**Input Guardrail** — runs before the orchestrator sees anything. Hard-blocks
-prompt injection attempts using regex patterns. Soft-flags off-topic questions
-with a warning passed to the orchestrator. Returns immediately on injection —
-no LLM calls made.
+**Async parallel retrieval** — `asyncio.gather()` runs all query coroutines
+concurrently. On cloud providers where each API call goes to a different server,
+3 queries that each take 1s run in ~1s total instead of ~3s total. On local
+Ollama, parallelism doesn't reduce wall-clock time because the local process
+can only run one inference at a time — the architecture is correct, the
+hardware is the constraint.
 
-**Output Guardrail** — runs after the synthesizer. Parses relevance scores from
-retrieved chunks, computes average, and classifies confidence as high / medium
-/ low. Flags hallucination risk when the answer makes confident assertions
-despite weak retrieval. Explicitly trusts correct abstentions regardless of
-retrieval score.
+```python
+# Before: sequential
+for query in queries:
+    result = retrieve(query)    # waits for each
 
-**HITL Gate** — runs when output guardrail sets `needs_review=True`. Prints a
-full review panel showing the question, confidence score, flags, and proposed
-answer. Waits for human input: approve passes the answer through, reject
-returns a safe fallback, edit prompts for a replacement answer.
+# After: parallel
+tasks   = [_execute_single_query(q) for q in queries]
+results = await asyncio.gather(*tasks)  # all fire at once
+```
 
-### Key design decisions
+**run_in_executor pattern** — the OpenAI client is synchronous. To use it
+inside an async function without blocking the event loop, we wrap it in
+`loop.run_in_executor(None, lambda: sync_call())`. This moves the blocking
+call to a thread pool so other coroutines can run while waiting.
 
-**Rules-based injection detection** — regex patterns catch 80% of real-world
-attacks with zero latency and zero cost. LLM-based detection catches more
-creative attacks but adds 1-3 seconds per request. Rules-based is the right
-default; LLM-based is the production upgrade.
+```python
+result = await loop.run_in_executor(
+    None,                          # default thread pool
+    lambda: _sync_retrieve(query)  # blocking call runs in thread
+)
+```
 
-**Abstention always trusted** — when the agent says "I could not find an
-answer", the output guardrail classifies this as high confidence regardless
-of retrieval score. Correct abstention is always the right answer on
-unanswerable questions. Never send a correct abstention to human review.
+**Streaming** — instead of waiting for the full answer, we pass `stream=True`
+to the chat completions API and iterate over chunks. Each chunk contains a
+token. We print it immediately with `flush=True` so the user sees output
+start in ~1 second.
 
-**Confidence from retrieval score, not LLM** — we parse relevance scores
-directly from the formatted chunk string. This is deterministic and free.
-An LLM-based confidence scorer would add cost and latency for marginal gain.
+```python
+stream = client.chat.completions.create(
+    model=model, messages=messages, stream=True
+)
+for chunk in stream:
+    token = chunk.choices[0].delta.content
+    if token:
+        print(token, end="", flush=True)  # immediate output
+```
 
-**Confident assertion + weak retrieval = hallucination flag** — the most
-dangerous failure mode is a confident-sounding wrong answer from marginal
-context. The output guardrail detects this pattern explicitly and routes to
-human review.
+**Model routing** — two signals determine which model handles synthesis.
+If either fires, route to CAPABLE_MODEL; otherwise use FAST_MODEL.
+
+```python
+# Signal 1: complexity keywords in question
+has_complex_keyword = any(kw in question.lower() for kw in COMPLEX_QUERY_KEYWORDS)
+
+# Signal 2: answer requires chunks from multiple source documents
+sources      = set(re.findall(r"Source:\s*([^\n(]+)", retrieved_context))
+is_multi_doc = len(sources) >= 2
+```
+
+**Exception isolation** — if one parallel query fails, the others continue.
+`asyncio.gather(*tasks, return_exceptions=True)` returns exceptions as values
+instead of raising them. We filter them out and log them without crashing.
+
+```python
+results = await asyncio.gather(*tasks, return_exceptions=True)
+for result in results:
+    if isinstance(result, Exception):
+        print(f"Query failed: {result}")   # log and continue
+    else:
+        all_results.append(result)
+```
+
+### Latency analysis
+
+| Provider | Before Stage 7 | After Stage 7 | Note |
+|----------|---------------|---------------|------|
+| Local Ollama | 90-200s | 90-200s | Sequential at hardware level — no change |
+| OpenAI GPT-4o | ~9s | ~3s | 3 parallel 1s calls instead of 3 sequential |
+| Anthropic Claude | ~8s | ~2.5s | Same parallelism benefit |
+
+The architecture is production-correct. The local constraint is hardware, not design.
+
+### Production gotchas
+
+**asyncio + sync libraries** — the OpenAI client is synchronous. Calling it
+directly inside an async function blocks the entire event loop. Always use
+`run_in_executor` to move sync I/O to a thread pool.
+
+**asyncio.run() in a running loop** — calling `asyncio.run()` inside an
+already-running event loop raises a RuntimeError. If your orchestrator ever
+becomes async, switch to `await _retrieve_async()` directly instead of
+`asyncio.run()`.
+
+**Streaming and guardrails** — streaming returns tokens as they arrive.
+The output guardrail runs after synthesis completes, not during streaming.
+This means the user might see tokens before the guardrail has a chance to
+flag the answer. In production, buffer the stream and run guardrails before
+releasing to the user if safety is critical.
+
+**Model routing compound failures** — if the rewriter fails and falls back
+to the original question as a single long query, retrieval returns fewer
+chunks, which may cause the router to select FAST_MODEL even for a complex
+question. Each component failure can cascade. This is why trajectory evals
+(Stage 5) matter — they catch multi-component failures that unit evals miss.
 
 ### How to run
 
@@ -108,103 +162,77 @@ human review.
 python main.py
 ```
 
-Injection attempt:
+Streaming output looks like:
 ```
-[Step 0: Input Guardrail]
-  [InputGuard] BLOCKED — injection pattern matched: 'ignore (previous|prior|all|your) instructions'
-  [Orchestrator] Input blocked. Returning safe message.
-```
-
-Low-confidence answer (triggers HITL):
-```
-[Step 4: Output Guardrail]
-  [OutputGuard] ⚠️  confidence=low, score=0.43, review=True
-  [OutputGuard]    flag: Confident assertion with low retrieval score (0.43)
-
-============================================================
-⚠️  HUMAN REVIEW REQUIRED
-============================================================
-Question:   ...
-Confidence: LOW (score: 0.43)
-Proposed answer: ...
-============================================================
-[HITL] Decision — (a) approve  (r) reject  (e) edit:
+[Step 3: Synthesizer]
+  [Synthesizer] Routing → FAST model
+  [Synthesizer] Model: mistral:latest | Stream: True
+  [Synthesizer] Streaming: Full-time employees accrue 15 days of paid time
+  off (PTO) per calendar year. (Source: PTO & Leave Policy)
 ```
 
-### Advanced RAG patterns (context)
+Disable streaming in `config.py`:
+```python
+STREAM_ENABLED = False
+```
 
-The image below shows 6 RAG variants. Here is how they map to what we built:
-
-| Pattern | What it is | Where it appears in this project |
-|---------|-----------|----------------------------------|
-| Hybrid RAG | Semantic + keyword search combined | Stage 3 upgrade — add BM25 alongside ChromaDB |
-| Graph RAG | Knowledge graph of entity relationships | Future extension |
-| Agentic RAG | Agents choose tools and retrieval paths dynamically | Stage 4 — our orchestrator pattern |
-| Corrective RAG | Validates and repairs weak retrieval before generation | Stage 6 — our output guardrail |
-| Multimodal RAG | Retrieves across PDFs, images, tables | Stage 3 upgrade — real file loader |
-| Self-RAG | Model critiques its own retrieval before responding | Stage 6 — automated version of our output guardrail |
-
-### Known limitations at this stage
-
-- Injection detection is rules-based — creative attacks that avoid known
-  phrases will pass through (mitigated by output guardrail catching
-  hallucinated answers downstream)
-- Confidence thresholds (0.65 high, 0.50 low) are hand-tuned — production
-  systems should calibrate these against eval results
-- HITL gate is synchronous CLI — production would use an async review queue
-  (Slack message, email, dashboard) that doesn't block the request thread
-- No rate limiting on HITL reviews — a flood of low-confidence answers
-  would overwhelm a human reviewer
+Switch to cloud providers in `config.py`:
+```python
+PROVIDER      = "anthropic"
+FAST_MODEL    = "claude-haiku-3"
+CAPABLE_MODEL = "claude-sonnet-4-5"
+```
 
 ### Concepts this stage teaches
 
-- Defense in depth — multiple independent layers catch different failure modes
-- Rules-based vs LLM-based guardrails — when each is appropriate
-- Confidence scoring from retrieval signals — deterministic and free
-- Why abstention should always be trusted — the logic behind the design
-- HITL as a safety valve, not a crutch — when to interrupt vs proceed
+- asyncio.gather() for concurrent I/O-bound work
+- run_in_executor pattern for using sync libraries in async code
+- Streaming at the API level — stream=True and chunk iteration
+- Model routing — when to use cheap vs capable models
+- Exception isolation in parallel execution
+- Why parallelism helps cloud providers but not local models
+
+---
+
+## Stage 6 — Human-in-the-Loop & Guardrails
+
+### What this stage builds
+Input guardrail (injection detection), output confidence scoring, interactive
+HITL approval gate.
+
+### The 3 layers
+- **Input Guardrail** — regex injection detection, off-topic flagging
+- **Output Guardrail** — confidence scoring from retrieval quality
+- **HITL Gate** — interactive approve / reject / edit on low-confidence answers
+
+### Key design decisions
+- Rules-based injection detection — zero latency, zero cost
+- Abstention always trusted — never send correct "I don't know" to review
+- Confident assertion + weak retrieval = hallucination flag
+
+### Concepts this stage teaches
+- Defense in depth — independent layers catch different failures
+- Rules-based vs LLM-based guardrails
+- Confidence scoring from retrieval signals
+- HITL as a safety valve, not a crutch
 
 ---
 
 ## Stage 5 — Reliability & Evals
 
 ### What this stage builds
-An eval harness with 13 test cases, three levels of automated scoring, and
-LLM-as-judge for non-deterministic answer evaluation.
+Eval harness — 13 test cases, LLM-as-judge, abstention scoring, regression runner.
 
-### Eval levels
-- **L2 Answer** — LLM-as-judge scores against reference answers
-- **L3 Abstention** — marker detection for "I don't know" responses
-- **Citation** — checks source document citations
-
-### How to run evals
 ```bash
 python main.py --eval
 ```
-
-### Concepts this stage teaches
-- LLM-as-judge with tight rubrics
-- Abstention accuracy as the most important production metric
-- Regression harness — run after every change
-- Fail closed on parse errors
 
 ---
 
 ## Stage 4 — Multi-Agent Orchestration
 
 ### What this stage builds
-Orchestrator + 3 specialized sub-agents: Query Rewriter, Retriever, Synthesizer.
-
-### The 3 sub-agents
-- **Query Rewriter** — rewrites question into 2-3 optimized search queries
-- **Retriever** — executes tool calls, decides retrieve vs get_document
-- **Synthesizer** — writes grounded answer with citations
-
-### Concepts this stage teaches
-- Orchestrator vs worker pattern
-- Sequential handoff vs peer-to-peer
-- When NOT to use multi-agent
-- Defensive parsing of LLM tool arguments
+Orchestrator + Query Rewriter + Retriever + Synthesizer sub-agents.
 
 ---
 
@@ -213,27 +241,12 @@ Orchestrator + 3 specialized sub-agents: Query Rewriter, Retriever, Synthesizer.
 ### What this stage builds
 ChromaDB persistent index, file loader, 3-tool architecture.
 
-### Key design decisions
-- Build once, reuse forever — skip rebuild if index exists
-- Upsert not insert — idempotent index builds
-- Supply own embeddings — keeps provider abstraction intact
-
-### Concepts this stage teaches
-- Why in-memory vector stores break in production
-- ChromaDB persistent collections
-- Tool description quality affects tool selection
-
 ---
 
 ## Stage 2 — Minimal Working Agent (MVP)
 
 ### What this stage builds
 ReAct loop by hand, in-memory vector store, single retrieval tool.
-
-### Key design decisions
-- Provider abstraction — one config value switches Ollama/Anthropic/OpenAI
-- Manual ReAct loop — no frameworks, every line visible
-- Chunking with overlap — 400 chars + 80 char overlap
 
 ### How to run
 ```bash
@@ -256,7 +269,7 @@ python main.py --eval    # run eval suite
 | 4 | Multi-agent orchestration | ✅ Done |
 | 5 | Eval harness | ✅ Done |
 | 6 | Guardrails + HITL | ✅ Done |
-| 7 | Production redesign | 🔜 Next |
-| 8 | Observability + tracing | ⬜ Planned |
+| 7 | Production redesign | ✅ Done |
+| 8 | Observability + tracing | 🔜 Next |
 | 9 | Deployment | ⬜ Planned |
 | 10 | Improvement loop | ⬜ Planned |

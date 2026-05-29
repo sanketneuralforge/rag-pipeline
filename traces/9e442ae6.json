@@ -1,0 +1,76 @@
+{
+  "run_id": "9e442ae6",
+  "question": "What is the rollback procedure for a bad deployment?",
+  "start_time": 1780069765.5964758,
+  "end_time": 1780069880.0384378,
+  "duration_s": 114.442,
+  "status": "success",
+  "metadata": {
+    "final_answer": "To rollback a bad deployment:\nRun 'make rollback ENV=prod' from the repo root to revert to the previous container image.\nIf the error rates do not stabilize within 10 minutes after starting the Rollba"
+  },
+  "total_tokens": 0,
+  "avg_relevance": 0.563,
+  "spans": [
+    {
+      "name": "input_guard",
+      "duration_s": 0.002,
+      "status": "success",
+      "metadata": {
+        "warning": null
+      },
+      "error": null
+    },
+    {
+      "name": "query_rewriter",
+      "duration_s": 15.626,
+      "status": "success",
+      "metadata": {
+        "queries": [
+          "rollback procedure failed deployment",
+          "undeploy software disaster process",
+          "bad release recovery steps"
+        ]
+      },
+      "error": null
+    },
+    {
+      "name": "retriever",
+      "duration_s": 39.861,
+      "status": "success",
+      "metadata": {
+        "results": 9,
+        "avg_relevance": 0.563
+      },
+      "error": null
+    },
+    {
+      "name": "synthesizer",
+      "duration_s": 58.949,
+      "status": "success",
+      "metadata": {
+        "answer_length": 285
+      },
+      "error": null
+    },
+    {
+      "name": "output_guard",
+      "duration_s": 0.003,
+      "status": "success",
+      "metadata": {
+        "confidence": "medium",
+        "score": 0.5633333333333334,
+        "needs_review": false
+      },
+      "error": null
+    },
+    {
+      "name": "hitl",
+      "duration_s": 0.0,
+      "status": "success",
+      "metadata": {
+        "reviewed": false
+      },
+      "error": null
+    }
+  ]
+}

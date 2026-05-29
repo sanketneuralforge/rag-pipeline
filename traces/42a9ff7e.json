@@ -1,0 +1,76 @@
+{
+  "run_id": "42a9ff7e",
+  "question": "How many PTO days do employees get per year?",
+  "start_time": 1780069648.2172658,
+  "end_time": 1780069765.576106,
+  "duration_s": 117.359,
+  "status": "success",
+  "metadata": {
+    "final_answer": "Full-time employees accrue 15 days of paid time off (PTO) per calendar year. (Source: PTO & Leave Policy)[1,2]"
+  },
+  "total_tokens": 0,
+  "avg_relevance": 0.629,
+  "spans": [
+    {
+      "name": "input_guard",
+      "duration_s": 0.001,
+      "status": "success",
+      "metadata": {
+        "warning": null
+      },
+      "error": null
+    },
+    {
+      "name": "query_rewriter",
+      "duration_s": 18.111,
+      "status": "success",
+      "metadata": {
+        "queries": [
+          "PTO entitlement annual",
+          "time off accured per year employees",
+          "employees vacation allowance"
+        ]
+      },
+      "error": null
+    },
+    {
+      "name": "retriever",
+      "duration_s": 43.912,
+      "status": "success",
+      "metadata": {
+        "results": 9,
+        "avg_relevance": 0.629
+      },
+      "error": null
+    },
+    {
+      "name": "synthesizer",
+      "duration_s": 55.331,
+      "status": "success",
+      "metadata": {
+        "answer_length": 110
+      },
+      "error": null
+    },
+    {
+      "name": "output_guard",
+      "duration_s": 0.004,
+      "status": "success",
+      "metadata": {
+        "confidence": "medium",
+        "score": 0.6288888888888889,
+        "needs_review": false
+      },
+      "error": null
+    },
+    {
+      "name": "hitl",
+      "duration_s": 0.0,
+      "status": "success",
+      "metadata": {
+        "reviewed": false
+      },
+      "error": null
+    }
+  ]
+}
