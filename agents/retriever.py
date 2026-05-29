@@ -1,6 +1,7 @@
 # agents/retriever.py
 
 import json
+import asyncio
 from openai import OpenAI
 from config import (
     PROVIDER,
@@ -35,87 +36,95 @@ Rules:
 
 def retrieve(question: str, queries: list[str]) -> str:
     """
-    Takes the original question and rewritten queries.
-    Returns all retrieved chunks as a single formatted string.
+    Public interface — runs async retrieval and returns combined results.
+    Wraps the async function so callers don't need to manage event loops.
     """
-    print(f"  [Retriever] Executing {len(queries)} queries")
+    return asyncio.run(_retrieve_async(question, queries))
+
+
+async def _retrieve_async(question: str, queries: list[str]) -> str:
+    """
+    Executes all queries in parallel using asyncio.gather.
+
+    Key concept: asyncio.gather() runs all coroutines concurrently.
+    Instead of: query1(3s) → query2(3s) → query3(3s) = 9s total
+    We get:     query1, query2, query3 all at once = ~3s total
+
+    Production gotcha: asyncio parallelism helps with I/O-bound work
+    (API calls, network requests). It does NOT help with CPU-bound work.
+    Embedding and LLM calls are I/O-bound — perfect fit for asyncio.
+    """
+    print(f"  [Retriever] Executing {len(queries)} queries in parallel")
+
+    # Create one coroutine per query and run them all concurrently
+    tasks   = [_execute_single_query(query) for query in queries]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Filter out exceptions — a single failed query should not crash everything
+    all_results = []
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            print(f"  [Retriever] Query {i+1} failed: {result}")
+        else:
+            all_results.append(result)
+
+    print(f"  [Retriever] Retrieved {len(all_results)} result(s)")
+    return "\n\n========\n\n".join(all_results)
+
+
+async def _execute_single_query(query: str) -> str:
+    """
+    Executes a single query against the vector store.
+    Runs in a thread pool to avoid blocking the event loop —
+    the OpenAI client is synchronous, so we use run_in_executor
+    to make it non-blocking.
+    """
+    loop = asyncio.get_event_loop()
+
+    # run_in_executor moves the blocking call to a thread pool
+    # This is the correct pattern for using sync libraries in async code
+    result = await loop.run_in_executor(
+        None,   # None = default thread pool executor
+        lambda: _sync_retrieve(query)
+    )
+    return result
+
+
+def _sync_retrieve(query: str) -> str:
+    """
+    Synchronous single-query retrieval.
+    Called from the thread pool via run_in_executor.
+    """
+    print(f"  [Retriever] retrieve_documents({{'query': '{query}'}})")
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {
             "role": "user",
-            "content": (
-                f"User question: {question}\n\n"
-                f"Search queries to execute: {json.dumps(queries)}"
-            ),
+            "content": f"Execute this search query: {query}",
         },
     ]
 
-    all_results = []
-
-    # Run the retrieval loop — same ReAct mechanics as the single agent
-    # but this agent only ever calls retrieval tools, never synthesizes
-    for _ in range(len(queries) + 2):   # enough iterations for all queries
-        response = _call_llm(messages)
-
-        if not response.tool_calls:
-            # No more tool calls — retrieval complete
-            break
-
-        for tool_call in response.tool_calls:
-            tool_name = tool_call.function.name
-            tool_args = json.loads(tool_call.function.arguments)
-
-            print(f"  [Retriever] {tool_name}({tool_args})")
-
-            result = execute_tool(tool_name, tool_args)
-            all_results.append(result)
-
-            # Append tool call + result to message history
-            messages.append({
-                "role":       "assistant",
-                "content":    None,
-                "tool_calls": [{
-                    "id":       tool_call.id,
-                    "type":     "function",
-                    "function": {
-                        "name":      tool_name,
-                        "arguments": tool_call.function.arguments,
-                    }
-                }]
-            })
-            messages.append({
-                "role":         "tool",
-                "tool_call_id": tool_call.id,
-                "content":      result,
-            })
-
-    combined = "\n\n========\n\n".join(all_results)
-    print(f"  [Retriever] Retrieved {len(all_results)} result(s)")
-    return combined
-
-
-def _call_llm(messages: list[dict]):
-    if PROVIDER == "anthropic":
-        return _call_anthropic(messages)
-
+    # Simple single-tool call — no loop needed for individual queries
     response = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=messages,
         tools=TOOLS,
+        max_tokens=512,
     )
-    return response.choices[0].message
 
+    msg = response.choices[0].message
 
-def _call_anthropic(messages: list[dict]):
-    import anthropic as ac
-    from agent import _convert_tools_for_anthropic, _AnthropicResponseWrapper
-    anth     = ac.Anthropic(api_key=ANTHROPIC_API_KEY)
-    response = anth.messages.create(
-        model=CHAT_MODEL,
-        max_tokens=1024,
-        system=messages[0]["content"],
-        messages=messages[1:],
-        tools=_convert_tools_for_anthropic(),
-    )
-    return _AnthropicResponseWrapper(response)
+    if msg.tool_calls:
+        tool_call = msg.tool_calls[0]
+        tool_name = tool_call.function.name
+        tool_args = json.loads(tool_call.function.arguments)
+
+        # Coerce list to string — Mistral sometimes wraps query in a list
+        if isinstance(tool_args.get("query"), list):
+            tool_args["query"] = " ".join(tool_args["query"])
+
+        return execute_tool(tool_name, tool_args)
+
+    # Model returned text instead of tool call — return it as-is
+    return msg.content or ""
